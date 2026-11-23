@@ -21,4 +21,6 @@ La API responde en `/api/*`; `/api/health` sirve para comprobar que está arriba
 
 ## Estado de persistencia
 
-La versión separada aún conserva el almacenamiento local `db.json` y `data/` para desarrollo. Ambos están excluidos de Git. **No desplegar como producción hasta migrar la persistencia y los archivos a Supabase**; los discos de los contenedores pueden ser efímeros.
+La versión separada aún conserva el almacenamiento local `db.json` y `data/` para desarrollo. Ambos están excluidos de Git. **Este backend todavía no está conectado a Supabase y no se debe desplegar como producción hasta migrar la persistencia y los archivos**; los discos de los contenedores pueden ser efímeros.
+
+Supabase se usará como Postgres y almacenamiento de archivos. No aloja este `server.js` Express como un servidor Node permanente: Supabase Edge Functions son funciones TypeScript sobre Deno, así que portar toda esta API allí sería una reescritura. La API Express necesita correr en Cloudflare Containers/Workers Builds o en otro proveedor Node y conectarse a Supabase desde el servidor.
