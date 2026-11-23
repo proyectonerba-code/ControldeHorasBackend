@@ -862,10 +862,20 @@ function tituloSemana(fecha) {
  *********************************************************************************/
 
 const app = express();
+function normalizarOrigenFrontend(origen) {
+  try {
+    return new URL(String(origen || '').trim()).origin;
+  } catch {
+    return '';
+  }
+}
+
 const origenesFrontend = new Set(
   String(process.env.FRONTEND_ORIGINS || process.env.FRONTEND_ORIGIN || 'http://localhost:5500,http://127.0.0.1:5500')
-    .split(',').map(origen => origen.trim()).filter(Boolean)
+    .split(',').map(normalizarOrigenFrontend).filter(Boolean)
 );
+// Dominio canónico donde se conserva correctamente la sesión del admin.
+origenesFrontend.add('https://asistencia.gruponerba.com');
 const cookieSameSite = String(process.env.COOKIE_SAME_SITE || 'lax').toLowerCase();
 const corsOptions = {
   origin(origen, callback) {
