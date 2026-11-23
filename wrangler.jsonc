@@ -1,0 +1,36 @@
+{
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  "name": "jjmclock-api",
+  "main": "src/index.mjs",
+  "compatibility_date": "2026-11-23",
+  "observability": {
+    "enabled": true
+  },
+  "containers": [
+    {
+      "class_name": "JjmApiContainer",
+      "image": "./Dockerfile",
+      "max_instances": 1
+    }
+  ],
+  "durable_objects": {
+    "bindings": [
+      {
+        "name": "API",
+        "class_name": "JjmApiContainer"
+      }
+    ]
+  },
+  "exports": {
+    "JjmApiContainer": {
+      "type": "durable-object",
+      "storage": "sqlite"
+    }
+  },
+  "vars": {
+    "SUPABASE_URL": "https://hswszojtwbuejxmbklfn.supabase.co",
+    "FRONTEND_ORIGINS": "https://controldehorasfront.pages.dev,https://asistencia.gruponerba.com",
+    "COOKIE_SAME_SITE": "lax",
+    "NODE_ENV": "production"
+  }
+}

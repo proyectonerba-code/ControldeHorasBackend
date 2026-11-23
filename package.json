@@ -5,7 +5,9 @@
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
-    "dev": "node server.js"
+    "dev": "node server.js",
+    "cf:dev": "npx --yes wrangler dev",
+    "cf:deploy": "npx --yes wrangler deploy"
   },
   "dependencies": {
     "cookie-parser": "^1.4.6",

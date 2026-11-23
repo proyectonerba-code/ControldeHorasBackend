@@ -1,0 +1,12 @@
+.git
+.wrangler
+node_modules
+.env
+.env.*
+db.json
+db.json.*
+data
+*.log
+scripts
+supabase
+README.md

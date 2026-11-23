@@ -20,6 +20,7 @@ const fs = require('fs');
 const crypto = require('crypto');
 const { promisify } = require('util');
 const webpush = require('web-push');
+const { SupabaseStore } = require('./supabase-store');
 const scryptAsync = promisify(crypto.scrypt);
 
 // =============================================
@@ -116,8 +117,22 @@ const TABLAS = [
   "auditoria_superadmin"
 ];
 
+const SUPABASE_URL = String(process.env.SUPABASE_URL || "").trim();
+const SUPABASE_KEY = String(
+  process.env.SUPABASE_SECRET_KEY || process.env.SUPABASE_SERVICE_ROLE_KEY || ""
+).trim();
+const USAR_SUPABASE = Boolean(SUPABASE_URL || SUPABASE_KEY);
+
+if (USAR_SUPABASE && (!SUPABASE_URL || !SUPABASE_KEY)) {
+  throw new Error("Para usar Supabase configura SUPABASE_URL y SUPABASE_SECRET_KEY.");
+}
+
 let db = {};
 let nextIdCounter = {};
+let supabaseStore = null;
+let snapshotSupabase = null;
+let colaPersistencia = Promise.resolve();
+let ultimoErrorPersistencia = null;
 
 function cargarDB() {
   if (fs.existsSync(DB_PATH)) {
@@ -142,12 +157,85 @@ function resetDB() {
   TABLAS.forEach(t => { db[t] = []; });
 }
 
+function copiarColecciones(origen = db) {
+  return Object.fromEntries(TABLAS.map(tabla => [
+    tabla,
+    JSON.parse(JSON.stringify(origen[tabla] || []))
+  ]));
+}
+
 function guardarDB() {
+  if (USAR_SUPABASE) {
+    if (!supabaseStore || !snapshotSupabase) {
+      throw new Error("La conexión a Supabase todavía no terminó de inicializarse.");
+    }
+    colaPersistencia = colaPersistencia.then(async () => {
+      const snapshot = copiarColecciones();
+      await supabaseStore.persistChanges(snapshot, snapshotSupabase);
+      snapshotSupabase = snapshot;
+      ultimoErrorPersistencia = null;
+    }).catch(error => {
+      ultimoErrorPersistencia = error;
+      console.error("No se pudo guardar en Supabase:", error.message);
+    });
+    return;
+  }
   const payload = { db, nextId: nextIdCounter };
   fs.writeFileSync(DB_PATH, JSON.stringify(payload, null, 2), "utf8");
 }
 
+async function esperarPersistenciaDB() {
+  if (!USAR_SUPABASE) return;
+  await colaPersistencia;
+  if (ultimoErrorPersistencia) {
+    ultimoErrorPersistencia = null;
+    guardarDB();
+    await colaPersistencia;
+    if (ultimoErrorPersistencia) {
+      throw new Error("No se pudieron guardar los cambios en Supabase: " + ultimoErrorPersistencia.message);
+    }
+  }
+}
+
+function tieneDatosLocales() {
+  if (!fs.existsSync(DB_PATH)) return false;
+  try {
+    const payload = JSON.parse(fs.readFileSync(DB_PATH, "utf8"));
+    const datos = payload.db || payload;
+    return TABLAS.some(tabla => Array.isArray(datos[tabla]) && datos[tabla].length > 0);
+  } catch {
+    return false;
+  }
+}
+
+async function cargarDBSupabase() {
+  supabaseStore = new SupabaseStore({
+    url: SUPABASE_URL,
+    key: SUPABASE_KEY,
+    collections: TABLAS
+  });
+  const remoto = await supabaseStore.load();
+  const tieneDatosRemotos = TABLAS.some(tabla => remoto.db[tabla].length > 0);
+  if (!tieneDatosRemotos && tieneDatosLocales()) {
+    throw new Error(
+      "Supabase está vacío y db.json local contiene datos. Migra primero con " +
+      "scripts/migrar-db-local-a-supabase.js --apply para evitar perderlos."
+    );
+  }
+  db = remoto.db;
+  nextIdCounter = remoto.nextId;
+  snapshotSupabase = copiarColecciones(db);
+  console.log("Persistencia Supabase cargada.");
+}
+
 function nextId(tabla) {
+  if (USAR_SUPABASE) {
+    let id = 0;
+    do {
+      id = crypto.randomBytes(6).readUIntBE(0, 6);
+    } while (!id || (db[tabla] || []).some(fila => fila.id === id));
+    return id;
+  }
   if (!nextIdCounter[tabla]) nextIdCounter[tabla] = 1;
   return nextIdCounter[tabla]++;
 }
@@ -183,7 +271,7 @@ function findOne(tabla, filtroFn) {
   return db[tabla].find(filtroFn);
 }
 
-cargarDB();
+resetDB();
 
 // =============================================
 // INICIALIZAR DATOS POR DEFECTO
@@ -198,7 +286,6 @@ function inicializarDatos() {
   });
   if (cambio) guardarDB();
 }
-inicializarDatos();
 
 function crearAreasPredeterminadas(empresaId) {
   if (findOne("areas", a => a.empresa_id === empresaId)) return;
@@ -221,7 +308,6 @@ function inicializarAreasExistentes() {
   });
   if (cambios) guardarDB();
 }
-inicializarAreasExistentes();
 
 function areasActivasEmpresa(empresaId) {
   return find("areas", a => a.empresa_id === empresaId && Number(a.activo) === 1);
@@ -264,7 +350,6 @@ function inicializarSuscripcionesEquipos() {
   });
   if (cambios) guardarDB();
 }
-inicializarSuscripcionesEquipos();
 
 // Asociar la hoja de horas entregada con la empresa histórica EMPRESA01.
 // El vínculo se guarda en el registro de esa empresa para no exponerla a equipos nuevos.
@@ -275,7 +360,6 @@ function asociarArchivoHorasOriginal() {
   update("empresa", empresaOriginal.id, { archivo_horas_original: "data/horas-original.xlsx" });
   console.log(`Archivo de horas original vinculado al equipo histórico (${empresaOriginal.id}).`);
 }
-asociarArchivoHorasOriginal();
 
 const CODIGO_EMPRESA_ALFABETO = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
 const COOKIE_SESION = "asistencia_session";
@@ -802,6 +886,28 @@ app.use((req, res, next) => {
 app.use(cors(corsOptions));
 app.use(express.json({ limit: "1mb" }));
 app.use(cookieParser());
+app.use((req, res, next) => {
+  if (!USAR_SUPABASE) return next();
+  const enviar = res.send.bind(res);
+  let esperandoGuardado = false;
+  res.send = function (...args) {
+    if (esperandoGuardado) return res;
+    esperandoGuardado = true;
+    esperarPersistenciaDB().then(() => enviar(...args)).catch(error => {
+      console.error("Se rechazó una respuesta porque no se guardaron los cambios:", error.message);
+      if (res.headersSent) {
+        res.destroy(error);
+        return;
+      }
+      res.statusCode = 503;
+      res.setHeader("Content-Type", "application/json; charset=utf-8");
+      res.setHeader("Cache-Control", "no-store");
+      enviar(JSON.stringify({ ok: false, error: "No se pudo guardar la información. Inténtalo de nuevo." }));
+    });
+    return res;
+  };
+  next();
+});
 app.get("/", (req, res) => res.json({ ok: true, app: APP_NAME, api: "/api/health" }));
 
 // Helper: obtener empresa y usuario desde cookie de sesión
@@ -3432,7 +3538,15 @@ const intentosSuperadmin = new Map();
 let tokenSetupSuperadmin = process.env.SUPERADMIN_SETUP_TOKEN || "";
 let tokenSetupGenerado = false;
 
-if (!db.superadmins.length && !tokenSetupSuperadmin) {
+function prepararTokenSetupSuperadmin() {
+  if (db.superadmins.some(superadmin => superadmin.activo === 1)) {
+    tokenSetupSuperadmin = "";
+    return;
+  }
+  if (tokenSetupSuperadmin) return;
+  if (USAR_SUPABASE) {
+    throw new Error("Configura SUPERADMIN_SETUP_TOKEN como secreto antes del primer arranque en Supabase.");
+  }
   try {
     fs.mkdirSync(DIRECTORIO_DATOS, { recursive: true });
     if (fs.existsSync(ARCHIVO_SUPERADMIN_SETUP)) {
@@ -3879,22 +3993,49 @@ async function revisarRecordatoriosProgramados() {
 }
 
 let recordatoriosEnCurso = false;
-setInterval(async () => {
-  if (recordatoriosEnCurso) return;
-  recordatoriosEnCurso = true;
-  try { await revisarRecordatoriosProgramados(); }
-  catch (error) { console.warn("No se pudieron revisar los recordatorios:", error.message); }
-  finally { recordatoriosEnCurso = false; }
-}, 60 * 1000);
+function iniciarRecordatoriosProgramados() {
+  setInterval(async () => {
+    if (recordatoriosEnCurso) return;
+    recordatoriosEnCurso = true;
+    try { await revisarRecordatoriosProgramados(); }
+    catch (error) { console.warn("No se pudieron revisar los recordatorios:", error.message); }
+    finally { recordatoriosEnCurso = false; }
+  }, 60 * 1000);
+}
 
 // =============================================
 // ARRANQUE
 // =============================================
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
-  console.log(`🚀 ${APP_NAME} API escuchando en el puerto ${PORT}`);
-  if (tokenSetupGenerado && tokenSetupSuperadmin) {
-    console.log("🔐 Se generó una clave de configuración inicial para superadmin; almacénala fuera de los logs antes de configurarla en producción.");
-  }
+async function iniciarServidor() {
+  if (USAR_SUPABASE) await cargarDBSupabase();
+  else cargarDB();
+
+  inicializarDatos();
+  inicializarAreasExistentes();
+  inicializarSuscripcionesEquipos();
+  asociarArchivoHorasOriginal();
+  prepararTokenSetupSuperadmin();
+  await esperarPersistenciaDB();
+
+  iniciarRecordatoriosProgramados();
+  const server = app.listen(PORT, () => {
+    console.log(`🚀 ${APP_NAME} API escuchando en el puerto ${PORT}`);
+    if (tokenSetupGenerado && tokenSetupSuperadmin) {
+      console.log("🔐 Se generó una clave de configuración inicial para superadmin; almacénala fuera de los logs antes de configurarla en producción.");
+    }
+  });
+  const cerrar = () => {
+    esperarPersistenciaDB()
+      .catch(error => console.error("No se guardaron los últimos cambios al apagar:", error.message))
+      .finally(() => server.close());
+  };
+  process.once("SIGTERM", cerrar);
+  process.once("SIGINT", cerrar);
+}
+
+iniciarServidor().catch(error => {
+  console.error("No se pudo iniciar JJM Clock:", error.message);
+  process.exitCode = 1;
 });
