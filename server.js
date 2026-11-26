@@ -1067,6 +1067,7 @@ app.post("/api/registro/empresa", async (req, res) => {
     cuerpo: `${empresa.nombre} ya aparece en la bandeja para revisar su solicitud.`,
     url: "/superadmin.html"
   });
+  await esperarPersistenciaDB();
   res.json({ ok: true, usuario: usuarioPublico(usuario, empresa) });
 });
 
@@ -1108,6 +1109,7 @@ app.post("/api/registro/admin-inicial", async (req, res) => {
   if (administradorViejo) update("usuarios", administradorViejo.id, { activo: 0, rol: "empleado" });
   codigosConfiguracionAdmin.delete(empresa.id);
   crearSesion(res, usuario);
+  await esperarPersistenciaDB();
   res.json({ ok: true, usuario: usuarioPublico(usuario, empresa), codigo_equipo: empresa.codigo, codigo_anterior: codigoAnterior });
 });
 
@@ -1154,6 +1156,9 @@ app.post("/api/registro/equipo", async (req, res) => {
   }
   crearSesion(res, usuario);
   notificarAdministradoresCupo(empresa.id);
+  // Persistir ANTES de responder: si el contenedor se reinicia, el miembro no se pierde
+  // y el administrador lo ve en su lista desde cualquier dispositivo.
+  await esperarPersistenciaDB();
   res.json({ ok: true, usuario: usuarioPublico(usuario, empresa) });
 });
 
@@ -1228,7 +1233,7 @@ function obtenerFechaHoyFecha() {
   return normalizarFechaSoloDia(new Date());
 }
 
-app.post("/api/asistencia/marcar", requireAuth, (req, res) => {
+app.post("/api/asistencia/marcar", requireAuth, async (req, res) => {
   const { tipo, lat, lng } = req.body; // entrada, salida, comida_entrada, comida_salida
   const usuario = req.usuario;
   const empresaId = usuario.empresa_id;
@@ -1278,6 +1283,7 @@ app.post("/api/asistencia/marcar", requireAuth, (req, res) => {
     );
 
     if (existente) {
+      await esperarPersistenciaDB();
       return res.json({ ok: true, tipo: "domingo", mensaje: "Ya hay registro de domingo (incidencia). No se procesa cierre automático.", data: existente });
     }
 
@@ -1300,6 +1306,7 @@ app.post("/api/asistencia/marcar", requireAuth, (req, res) => {
     actualizarPendienteWeb(empresaId, correo, nombre, area, fechaTexto, fechaTextoMostrar, hora);
     actualizarPeriodoLaboral(empresaId, correo, fecha);
 
+    await esperarPersistenciaDB();
     return res.json({ ok: true, tipo: "domingo", mensaje: "Registro de domingo como incidencia (no suma horas).", data: info });
   }
 
@@ -1327,6 +1334,7 @@ app.post("/api/asistencia/marcar", requireAuth, (req, res) => {
         });
         actualizarPendienteWeb(empresaId, correo, nombre, area, fechaTexto, fechaTextoMostrar, hora, existente.id);
         actualizarPeriodoLaboral(empresaId, correo, fecha);
+        await esperarPersistenciaDB();
         return res.json({ ok: true, tipo: "entrada", mensaje: "Entrada actualizada.", data: { id: existente.id, entrada: hora } });
       }
 
@@ -1346,6 +1354,7 @@ app.post("/api/asistencia/marcar", requireAuth, (req, res) => {
       actualizarPendienteWeb(empresaId, correo, nombre, area, fechaTexto, fechaTextoMostrar, hora, nueva.id);
       actualizarPeriodoLaboral(empresaId, correo, fecha);
 
+      await esperarPersistenciaDB();
       return res.json({ ok: true, tipo: "entrada", mensaje: "Entrada registrada.", data: { id: nueva.id, entrada: hora } });
     }
 
@@ -1381,6 +1390,7 @@ app.post("/api/asistencia/marcar", requireAuth, (req, res) => {
       eliminarPendienteWeb(empresaId, correo, fechaTexto, existente.id);
       actualizarPeriodoLaboral(empresaId, correo, fecha);
 
+      await esperarPersistenciaDB();
       return res.json({
         ok: true,
         tipo: "salida",
@@ -1408,6 +1418,7 @@ app.post("/api/asistencia/marcar", requireAuth, (req, res) => {
       const obs = (existente.observaciones || "") + `\nComida entrada: ${hora} (web)`;
       update("asistencia", existente.id, { observaciones: obs, comida_entrada: hora, comida_salida: "" });
 
+      await esperarPersistenciaDB();
       return res.json({ ok: true, tipo: "comida_entrada", mensaje: "Entrada de comida registrada.", data: { hora } });
     }
 
@@ -1427,6 +1438,7 @@ app.post("/api/asistencia/marcar", requireAuth, (req, res) => {
       const obs = (existente.observaciones || "") + `\nComida salida: ${hora} (web)`;
       update("asistencia", existente.id, { observaciones: obs, comida_salida: hora });
 
+      await esperarPersistenciaDB();
       return res.json({ ok: true, tipo: "comida_salida", mensaje: "Salida de comida registrada.", data: { hora } });
     }
 
