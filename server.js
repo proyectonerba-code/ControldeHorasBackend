@@ -3711,7 +3711,7 @@ app.get("/api/superadmin/equipos", requireSuperadmin, (req, res) => {
   res.json({ ok: true, ...resumen });
 });
 
-app.post("/api/superadmin/equipos/:id/activar", requireSuperadmin, (req, res) => {
+app.post("/api/superadmin/equipos/:id/activar", requireSuperadmin, async (req, res) => {
   const empresa = findOne("empresa", e => e.id === Number(req.params.id) && !e.archivada_en);
   if (!empresa) return res.status(404).json({ ok: false, error: "Equipo no encontrado." });
   const cupos = Number(req.body?.cupos_limite);
@@ -3748,10 +3748,13 @@ app.post("/api/superadmin/equipos/:id/activar", requireSuperadmin, (req, res) =>
     cuerpo: `Tu código para invitar al equipo está listo. Tienes ${cupos} cupos hasta el ${fin}.`,
     url: "/admin.html"
   });
+  // Espera a que Supabase persista ANTES de responder: así cualquier otro
+  // dispositivo o instancia que consulte la API ve el código activo de inmediato.
+  await esperarPersistenciaDB();
   res.json({ ok: true, equipo: datosEmpresaSuperadmin(empresa) });
 });
 
-app.post("/api/superadmin/equipos/:id/codigo", requireSuperadmin, (req, res) => {
+app.post("/api/superadmin/equipos/:id/codigo", requireSuperadmin, async (req, res) => {
   const empresa = findOne("empresa", e => e.id === Number(req.params.id) && !e.archivada_en);
   if (!empresa || !suscripcionActiva(empresa)) return res.status(409).json({ ok: false, error: "Activa la membresía antes de generar un código." });
   empresa.codigo = generarCodigoUnico();
@@ -3761,10 +3764,11 @@ app.post("/api/superadmin/equipos/:id/codigo", requireSuperadmin, (req, res) => 
     clave: `codigo-renovado-${empresa.id}-${Date.now()}`, titulo: "Código de invitación actualizado",
     cuerpo: "Tu administrador puede consultar el nuevo código desde Código y notificaciones.", url: "/admin.html"
   });
+  await esperarPersistenciaDB();
   res.json({ ok: true, codigo_equipo: empresa.codigo });
 });
 
-app.post("/api/superadmin/equipos/:id/pagos", requireSuperadmin, (req, res) => {
+app.post("/api/superadmin/equipos/:id/pagos", requireSuperadmin, async (req, res) => {
   const empresa = findOne("empresa", e => e.id === Number(req.params.id) && !e.archivada_en);
   if (!empresa) return res.status(404).json({ ok: false, error: "Equipo no encontrado." });
   const monto = Number(req.body?.monto_mxn);
@@ -3790,10 +3794,11 @@ app.post("/api/superadmin/equipos/:id/pagos", requireSuperadmin, (req, res) => {
     clave: `renovacion-${empresa.id}-${fin}`, titulo: "Membresía renovada",
     cuerpo: `El pago quedó registrado. Tu servicio está activo hasta el ${fin}.`, url: "/admin.html"
   });
+  await esperarPersistenciaDB();
   res.json({ ok: true, equipo: datosEmpresaSuperadmin(empresa) });
 });
 
-app.post("/api/superadmin/equipos/:id/declinar", requireSuperadmin, (req, res) => {
+app.post("/api/superadmin/equipos/:id/declinar", requireSuperadmin, async (req, res) => {
   const empresa = findOne("empresa", e => e.id === Number(req.params.id) && !e.archivada_en);
   if (!empresa) return res.status(404).json({ ok: false, error: "Equipo no encontrado." });
   empresa.estado_suscripcion = "declinada";
@@ -3802,10 +3807,11 @@ app.post("/api/superadmin/equipos/:id/declinar", requireSuperadmin, (req, res) =
   empresa.motivo_decline = String(req.body?.motivo || "Solicitud declinada.").trim();
   guardarDB();
   registrarAuditoriaSuperadmin(req.superadmin, "equipo_declinado", empresa.id, { motivo: empresa.motivo_decline });
+  await esperarPersistenciaDB();
   res.json({ ok: true });
 });
 
-app.delete("/api/superadmin/equipos/:id", requireSuperadmin, (req, res) => {
+app.delete("/api/superadmin/equipos/:id", requireSuperadmin, async (req, res) => {
   const empresa = findOne("empresa", e => e.id === Number(req.params.id) && !e.archivada_en);
   if (!empresa) return res.status(404).json({ ok: false, error: "Equipo no encontrado." });
   empresa.archivada_en = new Date().toISOString();
@@ -3813,6 +3819,7 @@ app.delete("/api/superadmin/equipos/:id", requireSuperadmin, (req, res) => {
   empresa.codigo = null;
   guardarDB();
   registrarAuditoriaSuperadmin(req.superadmin, "equipo_archivado", empresa.id, { nombre: empresa.nombre });
+  await esperarPersistenciaDB();
   res.json({ ok: true });
 });
 
