@@ -23,6 +23,12 @@ const webpush = require('web-push');
 const { SupabaseStore } = require('./supabase-store');
 const scryptAsync = promisify(crypto.scrypt);
 
+// Express 4 no captura errores de rutas async: sin esto, cualquier fallo de
+// persistencia tiraba el contenedor y Cloudflare respondía 502.
+process.on("unhandledRejection", (error) => {
+  console.error("Promesa rechazada no controlada:", error && error.message ? error.message : error);
+});
+
 // =============================================
 // CONFIGURACIÓN
 // =============================================
@@ -114,7 +120,6 @@ const TABLAS = [
   "pagos_suscripcion",
   "push_suscripciones",
   "notificaciones_enviadas",
-  "avisos",
   "auditoria_superadmin"
 ];
 
@@ -545,6 +550,30 @@ function claveFecha(fecha) {
   const f = normalizarFechaSoloDia(fecha);
   if (!f) return "";
   return `${String(f.getFullYear()).padStart(4, "0")}-${String(f.getMonth() + 1).padStart(2, "0")}-${String(f.getDate()).padStart(2, "0")}`;
+}
+
+// Días hábiles (lunes a viernes) entre dos fechas, inclusive.
+function diasLaborablesEntre(ini, fin) {
+  const inicio = fechaDesdeEntrada(ini);
+  const final = fechaDesdeEntrada(fin);
+  if (isNaN(inicio.getTime()) || isNaN(final.getTime()) || final < inicio) return 0;
+  let total = 0;
+  const cursor = new Date(inicio.getFullYear(), inicio.getMonth(), inicio.getDate(), 12, 0, 0, 0);
+  while (cursor <= final) {
+    const dia = cursor.getDay();
+    if (dia !== 0 && dia !== 6) total++;
+    cursor.setDate(cursor.getDate() + 1);
+  }
+  return total;
+}
+
+function claveHoy() {
+  return claveFecha(new Date());
+}
+
+function finHastaHoy(fechaFin) {
+  const hoy = claveHoy();
+  return !fechaFin || hoy < fechaFin ? hoy : fechaFin;
 }
 
 function fechaISOValida(valor) {
@@ -2251,14 +2280,16 @@ app.get("/api/admin/dias-trabajados-resumen", requireAdmin, (req, res) => {
   res.json({ ok: true, hoy, trabajadores: resumen });
 });
 
-app.post("/api/admin/vacaciones", requireAdmin, (req, res) => {
+app.post("/api/admin/vacaciones", requireAdmin, async (req, res) => {
   const empresaId = req.usuario.empresa_id;
   const { correo, fecha_ini, fecha_fin, dias_solicitados, motivo } = req.body || {};
   const correoNormalizado = normalizarCorreo(correo);
   const usuario = findOne("usuarios", u => u.empresa_id === empresaId && u.correo === correoNormalizado);
-  const dias = Number(dias_solicitados);
   const inicio = fecha_ini ? claveFecha(String(fecha_ini)) : "";
   const fin = fecha_fin ? claveFecha(String(fecha_fin)) : "";
+  // Si no se capturan los días, se calculan automáticamente (lunes a viernes).
+  const calculados = diasLaborablesEntre(inicio, fin);
+  const dias = Number(dias_solicitados) > 0 ? Math.floor(Number(dias_solicitados)) : calculados;
   if (!usuarioSeUnioConCodigo(usuario) || usuario.rol === "admin" || !inicio || !fin || fin < inicio || !Number.isInteger(dias) || dias <= 0) {
     return res.status(400).json({ ok: false, error: "Revisa el trabajador, las fechas y los días solicitados." });
   }
@@ -2267,10 +2298,11 @@ app.post("/api/admin/vacaciones", requireAdmin, (req, res) => {
     dias_solicitados: dias, motivo: String(motivo || "").trim(),
     estado: "pendiente", creado_en: new Date().toISOString()
   });
-  res.json({ ok: true });
+  await esperarPersistenciaDB();
+  res.json({ ok: true, dias_solicitados: dias });
 });
 
-app.post("/api/admin/vacaciones/:id/estado", requireAdmin, (req, res) => {
+app.post("/api/admin/vacaciones/:id/estado", requireAdmin, async (req, res) => {
   const empresaId = req.usuario.empresa_id;
   const solicitud = findOne("vacaciones_solicitud", v => v.id === Number(req.params.id) && v.empresa_id === empresaId);
   if (!solicitud) return res.status(404).json({ ok: false, error: "Solicitud de vacaciones no encontrada." });
@@ -2279,25 +2311,34 @@ app.post("/api/admin/vacaciones/:id/estado", requireAdmin, (req, res) => {
     return res.status(400).json({ ok: false, error: "Estado de solicitud no válido." });
   }
   update("vacaciones_solicitud", solicitud.id, { estado, revisado_en: new Date().toISOString() });
+  await esperarPersistenciaDB();
   res.json({ ok: true });
 });
 
 app.get("/api/admin/vacaciones", requireAdmin, (req, res) => {
   const empresaId = req.usuario.empresa_id;
+  const hoy = claveHoy();
   const filas = find("vacaciones_solicitud", v => v.empresa_id === empresaId)
     .sort((a, b) => new Date(b.creado_en) - new Date(a.creado_en));
   const resultado = filas.map(v => {
     const u = findOne("usuarios", us => us.empresa_id === empresaId && us.correo === v.correo);
     const periodo = findOne("periodo_laboral", p => p.empresa_id === empresaId && p.correo === v.correo);
-    const diasLaborales = Number(periodo?.dias_laborales || 0);
-    const aprobados = find("vacaciones_solicitud", x => x.empresa_id === empresaId && x.correo === v.correo && x.estado === "aprobada")
-      .reduce((s, x) => s + Number(x.dias_solicitados || 0), 0);
+    let diasLaborales = Number(periodo?.dias_laborales || 0);
+    // Si no capturaron el número de días, se infiere del rango del periodo.
+    if (!diasLaborales && periodo?.fecha_ini) {
+      diasLaborales = diasLaborablesEntre(periodo.fecha_ini, periodo.fecha_fin || hoy);
+    }
+    const aprobadas = find("vacaciones_solicitud", x => x.empresa_id === empresaId && x.correo === v.correo && x.estado === "aprobada");
+    // Solo descuentan los días que ya transcurrieron de cada ausencia aprobada.
+    const descontados = aprobadas.reduce((s, x) => s + diasLaborablesEntre(x.fecha_ini, finHastaHoy(x.fecha_fin)), 0);
+    const transcurridos = diasLaborablesEntre(v.fecha_ini, finHastaHoy(v.fecha_fin));
     return {
       ...v,
       nombre: u ? u.nombre : v.correo,
       dias_laborales: diasLaborales,
-      dias_aprobados: aprobados,
-      dias_restantes: diasLaborales ? Math.max(0, diasLaborales - aprobados) : null
+      dias_transcurridos: transcurridos,
+      dias_aprobados: descontados,
+      dias_restantes: diasLaborales ? Math.max(0, diasLaborales - descontados) : null
     };
   });
   res.json({ ok: true, solicitudes: resultado });
@@ -4028,7 +4069,24 @@ configurarRutasPush("superadmin", requireSuperadmin, "/api/superadmin/notificaci
 // AVISOS PERSONALIZADOS
 // Los admin envían avisos a TODOS sus trabajadores.
 // El superadmin envía avisos a TODOS los administradores.
+// La migración original de Supabase solo permite ciertas colecciones; por eso
+// los avisos se guardan dentro de auditoria_superadmin con un marcador. Así
+// funcionan en producción sin tener que ejecutar SQL adicional.
 // =============================================
+const COLECCION_AVISOS = "auditoria_superadmin";
+const MARCADOR_AVISO = "aviso_bandeja";
+
+function guardarAviso(datos) {
+  return insert(COLECCION_AVISOS, {
+    superadmin_id: null,
+    superadmin_correo: datos.origen,
+    empresa_id: datos.empresa_id || null,
+    accion: MARCADOR_AVISO,
+    detalle: { ...datos, leido_por: [] },
+    creado_en: datos.creado_en
+  });
+}
+
 app.post("/api/admin/avisos", requireAuth, async (req, res) => {
   const empresaId = req.usuario.empresa_id;
   const titulo = String(req.body?.titulo || "").trim().slice(0, 90);
@@ -4041,12 +4099,8 @@ app.post("/api/admin/avisos", requireAuth, async (req, res) => {
 
   const ahora = new Date().toISOString();
   const clave = `aviso-admin-${empresaId}-${Date.now()}`;
-  // Guardar el aviso en la bandeja de cada destinatario (se ve dentro de la app aunque no haya push).
   const destinatarios = trabajadores.map(u => ({ empresa_id: empresaId, correo: u.correo, nombre: u.nombre }));
-  insert("avisos", {
-    empresa_id: empresaId, origen: "admin", titulo, cuerpo, url,
-    destinatarios, creado_en: ahora, creado_por: req.usuario.correo, leido_por: []
-  });
+  guardarAviso({ empresa_id: empresaId, origen: "admin", titulo, cuerpo, url, destinatarios, creado_en: ahora, creado_por: req.usuario.correo });
   // Envío push a cada trabajador con su propio owner_id para respetar la deduplicación.
   const resultados = await Promise.allSettled(trabajadores.map(u =>
     enviarPush("usuario", u.id, empresaId, { clave, titulo, cuerpo, url })
@@ -4068,12 +4122,8 @@ app.post("/api/superadmin/avisos", requireSuperadmin, async (req, res) => {
 
   const ahora = new Date().toISOString();
   const clave = `aviso-superadmin-${Date.now()}`;
-  // Guardar en la bandeja de cada administrador.
   const destinatarios = administradores.map(u => ({ empresa_id: u.empresa_id, correo: u.correo, nombre: u.nombre }));
-  insert("avisos", {
-    empresa_id: null, origen: "superadmin", titulo, cuerpo, url,
-    destinatarios, creado_en: ahora, creado_por: "superadmin", leido_por: []
-  });
+  guardarAviso({ empresa_id: null, origen: "superadmin", titulo, cuerpo, url, destinatarios, creado_en: ahora, creado_por: "superadmin" });
   const resultados = await Promise.allSettled(administradores.map(u =>
     enviarPush("usuario", u.id, u.empresa_id, { clave, titulo, cuerpo, url })
   ));
@@ -4099,11 +4149,18 @@ function registrarAuditoriaGlobal(accion, detalle) {
 // dirigidos a su correo (los del admin o los del superadmin).
 function avisosParaCorreo(correo) {
   const normalizado = normalizarCorreo(correo);
-  return find("avisos", a => (a.destinatarios || []).some(d => normalizarCorreo(d.correo) === normalizado))
+  return find(COLECCION_AVISOS, a =>
+    a.accion === MARCADOR_AVISO &&
+    (a.detalle?.destinatarios || []).some(d => normalizarCorreo(d.correo) === normalizado)
+  )
     .map(a => ({
-      id: a.id, titulo: a.titulo, cuerpo: a.cuerpo, url: a.url || "/",
-      origen: a.origen, creado_en: a.creado_en,
-      leido: (a.leido_por || []).includes(normalizado)
+      id: a.id,
+      titulo: a.detalle?.titulo || "",
+      cuerpo: a.detalle?.cuerpo || "",
+      url: a.detalle?.url || "/",
+      origen: a.detalle?.origen || a.superadmin_correo,
+      creado_en: a.creado_en,
+      leido: (a.detalle?.leido_por || []).includes(normalizado)
     }))
     .sort((a, b) => String(b.creado_en).localeCompare(String(a.creado_en)))
     .slice(0, 50);
@@ -4114,13 +4171,13 @@ app.get("/api/avisos", requireAuth, (req, res) => {
 });
 
 app.post("/api/avisos/:id/leido", requireAuth, async (req, res) => {
-  const aviso = findOne("avisos", a => a.id === Number(req.params.id));
+  const aviso = findOne(COLECCION_AVISOS, a => a.id === Number(req.params.id) && a.accion === MARCADOR_AVISO);
   if (!aviso) return res.status(404).json({ ok: false, error: "Aviso no encontrado." });
   const correo = normalizarCorreo(req.usuario.correo);
-  const leido = aviso.leido_por || [];
+  const leido = aviso.detalle?.leido_por || [];
   if (!leido.includes(correo)) {
     leido.push(correo);
-    aviso.leido_por = leido;
+    aviso.detalle = { ...(aviso.detalle || {}), leido_por: leido };
     guardarDB();
     await esperarPersistenciaDB();
   }
