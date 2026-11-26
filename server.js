@@ -3856,6 +3856,25 @@ app.delete("/api/superadmin/equipos/:id", requireSuperadmin, async (req, res) =>
   res.json({ ok: true });
 });
 
+// Eliminación definitiva de un equipo y todos sus datos asociados.
+app.delete("/api/superadmin/equipos/:id/eliminar", requireSuperadmin, async (req, res) => {
+  const id = Number(req.params.id);
+  const empresa = findOne("empresa", e => e.id === id);
+  if (!empresa) return res.status(404).json({ ok: false, error: "Equipo no encontrado." });
+  const nombre = empresa.nombre;
+  const colecciones = ["usuarios", "areas", "horarios_especiales", "asistencia", "pendientes",
+    "periodo_laboral", "vacaciones_solicitud", "sesiones", "pagos_suscripcion",
+    "push_suscripciones", "notificaciones_enviadas", "auditoria_superadmin"];
+  let eliminados = 0;
+  colecciones.forEach(tabla => {
+    find(tabla, r => r.empresa_id === id).forEach(r => { remove(tabla, r.id); eliminados++; });
+  });
+  remove("empresa", id);
+  registrarAuditoriaGlobal("equipo_eliminado", { nombre, registros_eliminados: eliminados });
+  await esperarPersistenciaDB();
+  res.json({ ok: true, mensaje: `Se eliminó "${nombre}" y ${eliminados} registros asociados.`, eliminados });
+});
+
 app.get("/api/superadmin/equipos/:id/auditoria", requireSuperadmin, (req, res) => {
   const empresa = findOne("empresa", e => e.id === Number(req.params.id));
   if (!empresa) return res.status(404).json({ ok: false, error: "Equipo no encontrado." });
@@ -3982,6 +4001,63 @@ function configurarRutasPush(scope, requireMiddleware, prefijo) {
 
 configurarRutasPush("usuario", requireAuth, "/api/notificaciones");
 configurarRutasPush("superadmin", requireSuperadmin, "/api/superadmin/notificaciones");
+
+// =============================================
+// AVISOS PERSONALIZADOS
+// Los admin envían avisos a TODOS sus trabajadores.
+// El superadmin envía avisos a TODOS los administradores.
+// =============================================
+app.post("/api/admin/avisos", requireAuth, async (req, res) => {
+  const empresaId = req.usuario.empresa_id;
+  const titulo = String(req.body?.titulo || "").trim().slice(0, 90);
+  const cuerpo = String(req.body?.cuerpo || "").trim().slice(0, 400);
+  const url = String(req.body?.url || "/dashboard.html").trim();
+  if (!titulo || !cuerpo) return res.status(400).json({ ok: false, error: "Escribe el título y el mensaje del aviso." });
+
+  const trabajadores = find("usuarios", u => u.empresa_id === empresaId && u.activo === 1 && u.rol !== "admin");
+  if (!trabajadores.length) return res.status(400).json({ ok: false, error: "Tu equipo aún no tiene trabajadores activos." });
+
+  const clave = `aviso-admin-${empresaId}-${Date.now()}`;
+  // Se envía a cada trabajador con su propio owner_id para respetar la deduplicación por persona.
+  const resultados = await Promise.allSettled(trabajadores.map(u =>
+    enviarPush("usuario", u.id, empresaId, { clave, titulo, cuerpo, url })
+  ));
+  const enviados = resultados.filter(r => r.status === "fulfilled" && r.value !== false).length;
+  registrarAuditoriaGlobal("aviso_admin", { empresa_id: empresaId, titulo, trabajadores: trabajadores.length });
+  await esperarPersistenciaDB();
+  res.json({ ok: true, destinatarios: trabajadores.length, enviados, mensaje: `Aviso enviado a ${trabajadores.length} trabajador(es).` });
+});
+
+app.post("/api/superadmin/avisos", requireSuperadmin, async (req, res) => {
+  const titulo = String(req.body?.titulo || "").trim().slice(0, 90);
+  const cuerpo = String(req.body?.cuerpo || "").trim().slice(0, 400);
+  const url = String(req.body?.url || "/admin.html").trim();
+  if (!titulo || !cuerpo) return res.status(400).json({ ok: false, error: "Escribe el título y el mensaje del aviso." });
+
+  const administradores = find("usuarios", u => u.rol === "admin" && u.activo === 1);
+  if (!administradores.length) return res.status(400).json({ ok: false, error: "No hay administradores activos." });
+
+  const clave = `aviso-superadmin-${Date.now()}`;
+  const resultados = await Promise.allSettled(administradores.map(u =>
+    enviarPush("usuario", u.id, u.empresa_id, { clave, titulo, cuerpo, url })
+  ));
+  const enviados = resultados.filter(r => r.status === "fulfilled" && r.value !== false).length;
+  registrarAuditoriaGlobal("aviso_superadmin", { titulo, administradores: administradores.length });
+  await esperarPersistenciaDB();
+  res.json({ ok: true, destinatarios: administradores.length, enviados, mensaje: `Aviso enviado a ${administradores.length} administrador(es).` });
+});
+
+function registrarAuditoriaGlobal(accion, detalle) {
+  try {
+    insert("auditoria_superadmin", {
+      superadmin_id: null, superadmin_correo: "sistema",
+      empresa_id: detalle.empresa_id || null, accion, detalle,
+      creado_en: new Date().toISOString()
+    });
+  } catch (error) {
+    console.warn("No se pudo registrar auditoría del aviso:", error.message);
+  }
+}
 
 function horaLocalActual() {
   return new Intl.DateTimeFormat("en-GB", {
