@@ -2,7 +2,9 @@ import { DurableObject } from "cloudflare:workers";
 
 const API_PORT = 8080;
 const API_HEALTH_URL = "http://container/api/health";
-const INACTIVITY_TIMEOUT_MS = 5 * 60 * 1000;
+// Mantener el contenedor caliente más tiempo evita cold starts de ~30 s
+// que hacen que la app parezca "no cargar" en móvil.
+const INACTIVITY_TIMEOUT_MS = 30 * 60 * 1000;
 
 export class JjmApiContainer extends DurableObject {
   starting;
