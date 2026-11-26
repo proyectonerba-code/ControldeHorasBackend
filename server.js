@@ -133,6 +133,27 @@ let supabaseStore = null;
 let snapshotSupabase = null;
 let colaPersistencia = Promise.resolve();
 let ultimoErrorPersistencia = null;
+// Optimización: dirty flag y debounce para escrituras locales
+let dbDirty = false;
+let dbSaveTimer = null;
+const DB_SAVE_DEBOUNCE_MS = 300;
+
+function flushDB() {
+  if (dbSaveTimer) {
+    clearTimeout(dbSaveTimer);
+    dbSaveTimer = null;
+  }
+  if (!dbDirty) return;
+  dbDirty = false;
+  const payload = { db, nextId: nextIdCounter };
+  fs.writeFileSync(DB_PATH, JSON.stringify(payload, null, 2), "utf8");
+}
+
+function scheduleDBSave() {
+  dbDirty = true;
+  if (dbSaveTimer) return;
+  dbSaveTimer = setTimeout(flushDB, DB_SAVE_DEBOUNCE_MS);
+}
 
 function cargarDB() {
   if (fs.existsSync(DB_PATH)) {
@@ -180,8 +201,8 @@ function guardarDB() {
     });
     return;
   }
-  const payload = { db, nextId: nextIdCounter };
-  fs.writeFileSync(DB_PATH, JSON.stringify(payload, null, 2), "utf8");
+  // Modo local: marcar como dirty y programar escritura diferida
+  scheduleDBSave();
 }
 
 async function esperarPersistenciaDB() {
@@ -4020,6 +4041,19 @@ function iniciarRecordatoriosProgramados() {
 }
 
 // =============================================
+// MIDDLEWARE: flush de DB al final de cada respuesta
+// =============================================
+app.use((req, res, next) => {
+  const enviar = res.send.bind(res);
+  res.send = function (...args) {
+    const result = enviar.apply(res, args);
+    if (!USAR_SUPABASE) flushDB();
+    return result;
+  };
+  next();
+});
+
+// =============================================
 // ARRANQUE
 // =============================================
 
@@ -4044,6 +4078,7 @@ async function iniciarServidor() {
     }
   });
   const cerrar = () => {
+    flushDB();
     esperarPersistenciaDB()
       .catch(error => console.error("No se guardaron los últimos cambios al apagar:", error.message))
       .finally(() => server.close());
