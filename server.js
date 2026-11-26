@@ -433,8 +433,6 @@ function prepararCodigosConfiguracionAdmin() {
     console.log(`Código único para crear al administrador inicial de ${empresa.nombre}: ${codigo}`);
   });
 }
-prepararCodigosConfiguracionAdmin();
-
 // =============================================
 // UTILIDADES (migradas de tu Apps Script)
 // =============================================
@@ -991,8 +989,9 @@ function usuarioPublico(usuario, empresa) {
 }
 
 function usuarioSeUnioConCodigo(usuario) {
-  if (!usuario || !usuario.password_hash || usuario._alta_compartida === true) return false;
+  if (!usuario || !usuario.password_hash) return false;
   if (usuario._registro_codigo === true) return true;
+  if (usuario._alta_compartida === true) return true;
   // Compatibilidad con cuentas anteriores: los empleados ya activados se consideran miembros.
   return usuario.rol !== "admin";
 }
@@ -4026,6 +4025,7 @@ async function iniciarServidor() {
   inicializarAreasExistentes();
   inicializarSuscripcionesEquipos();
   asociarArchivoHorasOriginal();
+  prepararCodigosConfiguracionAdmin();
   prepararTokenSetupSuperadmin();
   await esperarPersistenciaDB();
 
