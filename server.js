@@ -114,6 +114,7 @@ const TABLAS = [
   "pagos_suscripcion",
   "push_suscripciones",
   "notificaciones_enviadas",
+  "avisos",
   "auditoria_superadmin"
 ];
 
@@ -4017,13 +4018,20 @@ app.post("/api/admin/avisos", requireAuth, async (req, res) => {
   const trabajadores = find("usuarios", u => u.empresa_id === empresaId && u.activo === 1 && u.rol !== "admin");
   if (!trabajadores.length) return res.status(400).json({ ok: false, error: "Tu equipo aún no tiene trabajadores activos." });
 
+  const ahora = new Date().toISOString();
   const clave = `aviso-admin-${empresaId}-${Date.now()}`;
-  // Se envía a cada trabajador con su propio owner_id para respetar la deduplicación por persona.
+  // Guardar el aviso en la bandeja de cada destinatario (se ve dentro de la app aunque no haya push).
+  const destinatarios = trabajadores.map(u => ({ empresa_id: empresaId, correo: u.correo, nombre: u.nombre }));
+  insert("avisos", {
+    empresa_id: empresaId, origen: "admin", titulo, cuerpo, url,
+    destinatarios, creado_en: ahora, creado_por: req.usuario.correo, leido_por: []
+  });
+  // Envío push a cada trabajador con su propio owner_id para respetar la deduplicación.
   const resultados = await Promise.allSettled(trabajadores.map(u =>
     enviarPush("usuario", u.id, empresaId, { clave, titulo, cuerpo, url })
   ));
   const enviados = resultados.filter(r => r.status === "fulfilled" && r.value !== false).length;
-  registrarAuditoriaGlobal("aviso_admin", { empresa_id: empresaId, titulo, trabajadores: trabajadores.length });
+  registrarAuditoriaGlobal("aviso_admin", { empresa_id: empresaId, titulo, trabajadores: trabajadores.length, push: enviados });
   await esperarPersistenciaDB();
   res.json({ ok: true, destinatarios: trabajadores.length, enviados, mensaje: `Aviso enviado a ${trabajadores.length} trabajador(es).` });
 });
@@ -4037,12 +4045,19 @@ app.post("/api/superadmin/avisos", requireSuperadmin, async (req, res) => {
   const administradores = find("usuarios", u => u.rol === "admin" && u.activo === 1);
   if (!administradores.length) return res.status(400).json({ ok: false, error: "No hay administradores activos." });
 
+  const ahora = new Date().toISOString();
   const clave = `aviso-superadmin-${Date.now()}`;
+  // Guardar en la bandeja de cada administrador.
+  const destinatarios = administradores.map(u => ({ empresa_id: u.empresa_id, correo: u.correo, nombre: u.nombre }));
+  insert("avisos", {
+    empresa_id: null, origen: "superadmin", titulo, cuerpo, url,
+    destinatarios, creado_en: ahora, creado_por: "superadmin", leido_por: []
+  });
   const resultados = await Promise.allSettled(administradores.map(u =>
     enviarPush("usuario", u.id, u.empresa_id, { clave, titulo, cuerpo, url })
   ));
   const enviados = resultados.filter(r => r.status === "fulfilled" && r.value !== false).length;
-  registrarAuditoriaGlobal("aviso_superadmin", { titulo, administradores: administradores.length });
+  registrarAuditoriaGlobal("aviso_superadmin", { titulo, administradores: administradores.length, push: enviados });
   await esperarPersistenciaDB();
   res.json({ ok: true, destinatarios: administradores.length, enviados, mensaje: `Aviso enviado a ${administradores.length} administrador(es).` });
 });
@@ -4058,6 +4073,38 @@ function registrarAuditoriaGlobal(accion, detalle) {
     console.warn("No se pudo registrar auditoría del aviso:", error.message);
   }
 }
+
+// Bandeja de avisos: cualquier usuario autenticado ve los avisos
+// dirigidos a su correo (los del admin o los del superadmin).
+function avisosParaCorreo(correo) {
+  const normalizado = normalizarCorreo(correo);
+  return find("avisos", a => (a.destinatarios || []).some(d => normalizarCorreo(d.correo) === normalizado))
+    .map(a => ({
+      id: a.id, titulo: a.titulo, cuerpo: a.cuerpo, url: a.url || "/",
+      origen: a.origen, creado_en: a.creado_en,
+      leido: (a.leido_por || []).includes(normalizado)
+    }))
+    .sort((a, b) => String(b.creado_en).localeCompare(String(a.creado_en)))
+    .slice(0, 50);
+}
+
+app.get("/api/avisos", requireAuth, (req, res) => {
+  res.json({ ok: true, avisos: avisosParaCorreo(req.usuario.correo) });
+});
+
+app.post("/api/avisos/:id/leido", requireAuth, async (req, res) => {
+  const aviso = findOne("avisos", a => a.id === Number(req.params.id));
+  if (!aviso) return res.status(404).json({ ok: false, error: "Aviso no encontrado." });
+  const correo = normalizarCorreo(req.usuario.correo);
+  const leido = aviso.leido_por || [];
+  if (!leido.includes(correo)) {
+    leido.push(correo);
+    aviso.leido_por = leido;
+    guardarDB();
+    await esperarPersistenciaDB();
+  }
+  res.json({ ok: true });
+});
 
 function horaLocalActual() {
   return new Intl.DateTimeFormat("en-GB", {
