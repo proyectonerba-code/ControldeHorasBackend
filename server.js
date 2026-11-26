@@ -2288,9 +2288,30 @@ app.get("/api/admin/vacaciones", requireAdmin, (req, res) => {
     .sort((a, b) => new Date(b.creado_en) - new Date(a.creado_en));
   const resultado = filas.map(v => {
     const u = findOne("usuarios", us => us.empresa_id === empresaId && us.correo === v.correo);
-    return { ...v, nombre: u ? u.nombre : v.correo };
+    const periodo = findOne("periodo_laboral", p => p.empresa_id === empresaId && p.correo === v.correo);
+    const diasLaborales = Number(periodo?.dias_laborales || 0);
+    const aprobados = find("vacaciones_solicitud", x => x.empresa_id === empresaId && x.correo === v.correo && x.estado === "aprobada")
+      .reduce((s, x) => s + Number(x.dias_solicitados || 0), 0);
+    return {
+      ...v,
+      nombre: u ? u.nombre : v.correo,
+      dias_laborales: diasLaborales,
+      dias_aprobados: aprobados,
+      dias_restantes: diasLaborales ? Math.max(0, diasLaborales - aprobados) : null
+    };
   });
   res.json({ ok: true, solicitudes: resultado });
+});
+
+// Eliminar un registro de la bitácora de vacaciones
+app.delete("/api/admin/vacaciones/:id", requireAdmin, async (req, res) => {
+  const empresaId = req.usuario.empresa_id;
+  const solicitud = findOne("vacaciones_solicitud", v => v.id === Number(req.params.id) && v.empresa_id === empresaId);
+  if (!solicitud) return res.status(404).json({ ok: false, error: "Registro no encontrado." });
+  remove("vacaciones_solicitud", solicitud.id);
+  guardarDB();
+  await esperarPersistenciaDB();
+  res.json({ ok: true });
 });
 
 // =============================================
