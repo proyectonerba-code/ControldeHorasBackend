@@ -3950,63 +3950,83 @@ app.get("/api/superadmin/equipos/:id/auditoria", requireSuperadmin, (req, res) =
 // NOTIFICACIONES PUSH PARA WEB Y MÓVIL
 // =============================================
 let WEB_PUSH_PUBLIC_KEY = "";
-function configurarWebPush() {
+function aplicarClavesVAPID(claves) {
+  webpush.setVapidDetails(process.env.VAPID_SUBJECT || "mailto:admin@gruponerba.com", claves.publicKey, claves.privateKey);
+  WEB_PUSH_PUBLIC_KEY = claves.publicKey;
+}
+
+// Las llaves VAPID deben ser ESTABLES: si cambian en cada deploy, todas las
+// suscripciones guardadas en los celulares quedan inválidas y no llega nada.
+// Se guardan en Supabase (colección permitida) y también en archivo local.
+async function configurarWebPush() {
   try {
     fs.mkdirSync(DIRECTORIO_DATOS, { recursive: true });
     const archivo = path.join(DIRECTORIO_DATOS, "web-push-vapid.json");
-    let claves;
     if (process.env.VAPID_PUBLIC_KEY && process.env.VAPID_PRIVATE_KEY) {
-      claves = { publicKey: process.env.VAPID_PUBLIC_KEY, privateKey: process.env.VAPID_PRIVATE_KEY };
-    } else if (fs.existsSync(archivo)) {
-      claves = JSON.parse(fs.readFileSync(archivo, "utf8"));
-    } else {
+      aplicarClavesVAPID({ publicKey: process.env.VAPID_PUBLIC_KEY, privateKey: process.env.VAPID_PRIVATE_KEY });
+      return;
+    }
+    let claves = USAR_SUPABASE
+      ? findOne("push_suscripciones", s => s.scope === "vapid_config")?.keys
+      : null;
+    if (!claves?.publicKey || !claves?.privateKey) {
+      if (fs.existsSync(archivo)) {
+        try { claves = JSON.parse(fs.readFileSync(archivo, "utf8")); } catch { claves = null; }
+      }
+    }
+    let debeGuardar = false;
+    if (!claves?.publicKey || !claves?.privateKey) {
       claves = webpush.generateVAPIDKeys();
+      debeGuardar = true;
       fs.writeFileSync(archivo, JSON.stringify(claves, null, 2), { encoding: "utf8", mode: 0o600 });
     }
-    webpush.setVapidDetails(process.env.VAPID_SUBJECT || "mailto:admin@example.com", claves.publicKey, claves.privateKey);
-    WEB_PUSH_PUBLIC_KEY = claves.publicKey;
+    aplicarClavesVAPID(claves);
+    if (USAR_SUPABASE && debeGuardar) {
+      const existente = findOne("push_suscripciones", s => s.scope === "vapid_config");
+      const registro = { scope: "vapid_config", owner_id: 0, empresa_id: null, endpoint: "vapid://config", keys: claves, creado_en: new Date().toISOString() };
+      if (existente) update("push_suscripciones", existente.id, registro);
+      else insert("push_suscripciones", registro);
+      await esperarPersistenciaDB();
+    }
   } catch (error) {
     console.error("No se pudo configurar Web Push:", error.message);
   }
 }
-configurarWebPush();
 
 function subscriptionValida(subscription) {
   try {
     const url = new URL(subscription?.endpoint || "");
-    const host = url.hostname.toLowerCase();
-    const hostPermitido = host === "fcm.googleapis.com" || host.endsWith(".fcm.googleapis.com")
-      || host === "push.services.mozilla.com" || host.endsWith(".push.services.mozilla.com")
-      || host === "updates.push.services.mozilla.com" || host === "web.push.apple.com" || host.endsWith(".push.apple.com")
-      || host === "notify.windows.com" || host.endsWith(".notify.windows.com");
-    return url.protocol === "https:" && hostPermitido
+    return url.protocol === "https:"
       && typeof subscription?.keys?.p256dh === "string" && subscription.keys.p256dh.length > 20
       && typeof subscription?.keys?.auth === "string" && subscription.keys.auth.length > 8;
   } catch (error) { return false; }
 }
 
 async function enviarPush(scope, ownerId, empresaId, payload) {
-  if (!WEB_PUSH_PUBLIC_KEY) return;
+  if (!WEB_PUSH_PUBLIC_KEY) return false;
   const suscripciones = find("push_suscripciones", s => s.scope === scope && s.owner_id === ownerId
-    && (empresaId === null || s.empresa_id === empresaId));
-  if (!suscripciones.length) return;
+    && s.scope !== "vapid_config" && (empresaId === null || s.empresa_id === empresaId));
+  if (!suscripciones.length) return false;
   const yaEnviada = findOne("notificaciones_enviadas", n => n.clave === payload.clave && n.scope === scope && n.owner_id === ownerId);
-  if (yaEnviada) return;
+  if (yaEnviada) return false;
   insert("notificaciones_enviadas", {
     clave: payload.clave, scope, owner_id: ownerId, empresa_id: empresaId,
     titulo: payload.titulo, creado_en: new Date().toISOString()
   });
-  await Promise.allSettled(suscripciones.map(async registro => {
+  const resultados = await Promise.allSettled(suscripciones.map(async registro => {
     try {
       await webpush.sendNotification({ endpoint: registro.endpoint, keys: registro.keys }, JSON.stringify({
         title: payload.titulo, body: payload.cuerpo, url: payload.url || "/", tag: payload.clave
       }), { TTL: 60 * 60 });
       update("push_suscripciones", registro.id, { ultimo_envio: new Date().toISOString() });
+      return true;
     } catch (error) {
       if (error.statusCode === 404 || error.statusCode === 410) remove("push_suscripciones", registro.id);
       else console.warn("Web Push no entregado:", error.statusCode || error.message);
+      return false;
     }
   }));
+  return resultados.some(r => r.status === "fulfilled" && r.value === true);
 }
 
 function notificarAdministradores(empresaId, payload) {
@@ -4039,25 +4059,40 @@ function notificarAdministradoresCupo(empresaId) {
 }
 
 function configurarRutasPush(scope, requireMiddleware, prefijo) {
+  function ownerDe(req) {
+    return scope === "usuario" ? req.usuario.id : req.superadmin.id;
+  }
   app.get(`${prefijo}/config`, requireMiddleware, (req, res) => {
-    res.json({ ok: true, disponible: Boolean(WEB_PUSH_PUBLIC_KEY), clave_publica: WEB_PUSH_PUBLIC_KEY });
+    const ownerId = ownerDe(req);
+    res.json({
+      ok: true,
+      disponible: Boolean(WEB_PUSH_PUBLIC_KEY),
+      clave_publica: WEB_PUSH_PUBLIC_KEY,
+      suscrito: find("push_suscripciones", s => s.scope === scope && s.owner_id === ownerId).length > 0
+    });
   });
-  app.post(`${prefijo}/suscripcion`, requireMiddleware, (req, res) => {
+  app.post(`${prefijo}/suscripcion`, requireMiddleware, async (req, res) => {
     const subscription = req.body?.subscription;
     if (!subscriptionValida(subscription)) return res.status(400).json({ ok: false, error: "La suscripción del navegador no es válida." });
-    const ownerId = scope === "usuario" ? req.usuario.id : req.superadmin.id;
+    const ownerId = ownerDe(req);
     const empresaId = scope === "usuario" ? req.usuario.empresa_id : null;
+    // Un mismo endpoint solo puede pertenecer a un dueño; si el usuario cambió
+    // de cuenta en este dispositivo, se reclama aquí para evitar envíos cruzados.
+    find("push_suscripciones", s => s.endpoint === subscription.endpoint && s.scope === scope && s.owner_id !== ownerId)
+      .forEach(s => remove("push_suscripciones", s.id));
     const existente = findOne("push_suscripciones", s => s.endpoint === subscription.endpoint && s.scope === scope && s.owner_id === ownerId);
     if (existente) {
       update("push_suscripciones", existente.id, { scope, owner_id: ownerId, empresa_id: empresaId, keys: subscription.keys, actualizado_en: new Date().toISOString() });
     } else {
       insert("push_suscripciones", { scope, owner_id: ownerId, empresa_id: empresaId, endpoint: subscription.endpoint, keys: subscription.keys, creado_en: new Date().toISOString() });
     }
+    await esperarPersistenciaDB();
     res.json({ ok: true });
   });
-  app.delete(`${prefijo}/suscripcion`, requireMiddleware, (req, res) => {
-    const ownerId = scope === "usuario" ? req.usuario.id : req.superadmin.id;
+  app.delete(`${prefijo}/suscripcion`, requireMiddleware, async (req, res) => {
+    const ownerId = ownerDe(req);
     find("push_suscripciones", s => s.scope === scope && s.owner_id === ownerId).forEach(s => remove("push_suscripciones", s.id));
+    await esperarPersistenciaDB();
     res.json({ ok: true });
   });
 }
@@ -4105,7 +4140,7 @@ app.post("/api/admin/avisos", requireAuth, async (req, res) => {
   const resultados = await Promise.allSettled(trabajadores.map(u =>
     enviarPush("usuario", u.id, empresaId, { clave, titulo, cuerpo, url })
   ));
-  const enviados = resultados.filter(r => r.status === "fulfilled" && r.value !== false).length;
+  const enviados = resultados.filter(r => r.status === "fulfilled" && r.value === true).length;
   registrarAuditoriaGlobal("aviso_admin", { empresa_id: empresaId, titulo, trabajadores: trabajadores.length, push: enviados });
   await esperarPersistenciaDB();
   res.json({ ok: true, destinatarios: trabajadores.length, enviados, mensaje: `Aviso enviado a ${trabajadores.length} trabajador(es).` });
@@ -4127,7 +4162,7 @@ app.post("/api/superadmin/avisos", requireSuperadmin, async (req, res) => {
   const resultados = await Promise.allSettled(administradores.map(u =>
     enviarPush("usuario", u.id, u.empresa_id, { clave, titulo, cuerpo, url })
   ));
-  const enviados = resultados.filter(r => r.status === "fulfilled" && r.value !== false).length;
+  const enviados = resultados.filter(r => r.status === "fulfilled" && r.value === true).length;
   registrarAuditoriaGlobal("aviso_superadmin", { titulo, administradores: administradores.length, push: enviados });
   await esperarPersistenciaDB();
   res.json({ ok: true, destinatarios: administradores.length, enviados, mensaje: `Aviso enviado a ${administradores.length} administrador(es).` });
@@ -4275,6 +4310,7 @@ async function iniciarServidor() {
   if (USAR_SUPABASE) await cargarDBSupabase();
   else cargarDB();
 
+  await configurarWebPush();
   inicializarDatos();
   inicializarAreasExistentes();
   inicializarSuscripcionesEquipos();
