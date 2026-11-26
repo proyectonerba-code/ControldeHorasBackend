@@ -4143,7 +4143,7 @@ app.post("/api/admin/avisos", requireAuth, async (req, res) => {
   const enviados = resultados.filter(r => r.status === "fulfilled" && r.value === true).length;
   registrarAuditoriaGlobal("aviso_admin", { empresa_id: empresaId, titulo, trabajadores: trabajadores.length, push: enviados });
   await esperarPersistenciaDB();
-  res.json({ ok: true, destinatarios: trabajadores.length, enviados, mensaje: `Aviso enviado a ${trabajadores.length} trabajador(es).` });
+  res.json({ ok: true, destinatarios: trabajadores.length, enviados, mensaje: `Aviso en la bandeja de ${trabajadores.length} trabajador(es). Push entregado en ${enviados} dispositivo(s).` });
 });
 
 app.post("/api/superadmin/avisos", requireSuperadmin, async (req, res) => {
@@ -4165,7 +4165,7 @@ app.post("/api/superadmin/avisos", requireSuperadmin, async (req, res) => {
   const enviados = resultados.filter(r => r.status === "fulfilled" && r.value === true).length;
   registrarAuditoriaGlobal("aviso_superadmin", { titulo, administradores: administradores.length, push: enviados });
   await esperarPersistenciaDB();
-  res.json({ ok: true, destinatarios: administradores.length, enviados, mensaje: `Aviso enviado a ${administradores.length} administrador(es).` });
+  res.json({ ok: true, destinatarios: administradores.length, enviados, mensaje: `Aviso en la bandeja de ${administradores.length} administrador(es). Push entregado en ${enviados} dispositivo(s).` });
 });
 
 function registrarAuditoriaGlobal(accion, detalle) {
