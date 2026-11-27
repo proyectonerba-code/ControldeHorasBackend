@@ -4004,8 +4004,11 @@ function subscriptionValida(subscription) {
 
 async function enviarPush(scope, ownerId, empresaId, payload) {
   if (!WEB_PUSH_PUBLIC_KEY) return false;
+  // owner_id ya identifica al destinatario; no filtrar por empresa evita
+  // perder entregas cuando el usuario cambió de equipo y su subscription quedó
+  // guardada con el empresa_id anterior.
   const suscripciones = find("push_suscripciones", s => s.scope === scope && s.owner_id === ownerId
-    && s.scope !== "vapid_config" && (empresaId === null || s.empresa_id === empresaId));
+    && s.scope !== "vapid_config");
   if (!suscripciones.length) return false;
   const yaEnviada = findOne("notificaciones_enviadas", n => n.clave === payload.clave && n.scope === scope && n.owner_id === ownerId);
   if (yaEnviada) return false;
@@ -4021,7 +4024,9 @@ async function enviarPush(scope, ownerId, empresaId, payload) {
       update("push_suscripciones", registro.id, { ultimo_envio: new Date().toISOString() });
       return true;
     } catch (error) {
-      if (error.statusCode === 404 || error.statusCode === 410) remove("push_suscripciones", registro.id);
+      // 403/401 = llave VAPID cambiada o suscripción inválida: se descarta para
+      // que el dispositivo se vuelva a dar de alta al abrir la app.
+      if ([400, 401, 403, 404, 410].includes(error.statusCode)) remove("push_suscripciones", registro.id);
       else console.warn("Web Push no entregado:", error.statusCode || error.message);
       return false;
     }
