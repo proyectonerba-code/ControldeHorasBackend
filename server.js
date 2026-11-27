@@ -4100,6 +4100,20 @@ function configurarRutasPush(scope, requireMiddleware, prefijo) {
 configurarRutasPush("usuario", requireAuth, "/api/notificaciones");
 configurarRutasPush("superadmin", requireSuperadmin, "/api/superadmin/notificaciones");
 
+// Diagnóstico (solo superadmin): permite ver cuántos dispositivos están dados
+// de alta, sin exponer endpoints ni claves de suscripción.
+app.get("/api/superadmin/notificaciones/diagnostico", requireSuperadmin, (req, res) => {
+  const activas = find("push_suscripciones", s => s.scope !== "vapid_config");
+  const porScope = {};
+  const porEmpresa = {};
+  activas.forEach(s => {
+    porScope[s.scope] = (porScope[s.scope] || 0) + 1;
+    const claveEmpresa = String(s.empresa_id || "superadmin");
+    porEmpresa[claveEmpresa] = (porEmpresa[claveEmpresa] || 0) + 1;
+  });
+  res.json({ ok: true, total: activas.length, por_scope: porScope, por_empresa: porEmpresa, clave_publica: WEB_PUSH_PUBLIC_KEY });
+});
+
 // =============================================
 // AVISOS PERSONALIZADOS
 // Los admin envían avisos a TODOS sus trabajadores.
@@ -4122,50 +4136,71 @@ function guardarAviso(datos) {
   });
 }
 
+// Selección de destinatarios. "todos" = aviso general (dueños + trabajadores
+// + superadmins); "admins" = dueños de equipo y además el propio superadmin.
+function seleccionarDestinatariosAviso(audiencia, empresaId) {
+  const activos = find("usuarios", u => u.activo === 1);
+  const superadmins = find("superadmins", s => s.activo === 1);
+  if (audiencia === "superadmins") return { usuarios: [], superadmins };
+  if (audiencia === "todos") return { usuarios: activos, superadmins };
+  if (audiencia === "admins") return { usuarios: activos.filter(u => u.rol === "admin"), superadmins };
+  if (audiencia === "equipo") return { usuarios: activos.filter(u => u.empresa_id === empresaId), superadmins: [] };
+  if (audiencia === "empresa") return { usuarios: activos.filter(u => u.empresa_id === empresaId && u.rol === "admin"), superadmins: [] };
+  return { usuarios: activos.filter(u => u.empresa_id === empresaId && u.rol !== "admin"), superadmins: [] };
+}
+
+async function entregarAviso(opciones) {
+  const { origen, titulo, cuerpo, url, empresaId, audiencia, clave } = opciones;
+  const { usuarios, superadmins } = seleccionarDestinatariosAviso(audiencia, empresaId);
+  const ahora = new Date().toISOString();
+  const destinatarios = [
+    ...usuarios.map(u => ({ empresa_id: u.empresa_id, correo: u.correo, nombre: u.nombre })),
+    ...superadmins.map(s => ({ empresa_id: null, correo: s.correo, nombre: s.nombre || "Superadmin" }))
+  ];
+  if (!destinatarios.length) return { destinatarios: 0, enviados: 0 };
+  guardarAviso({ empresa_id: empresaId || null, origen, titulo, cuerpo, url, destinatarios, creado_en: ahora, creado_por: origen });
+  const resultados = await Promise.allSettled([
+    ...usuarios.map(u => enviarPush("usuario", u.id, u.empresa_id, { clave, titulo, cuerpo, url })),
+    ...superadmins.map(s => enviarPush("superadmin", s.id, null, { clave, titulo, cuerpo, url }))
+  ]);
+  const enviados = resultados.filter(r => r.status === "fulfilled" && r.value === true).length;
+  await esperarPersistenciaDB();
+  return { destinatarios: destinatarios.length, enviados };
+}
+
 app.post("/api/admin/avisos", requireAuth, async (req, res) => {
   const empresaId = req.usuario.empresa_id;
   const titulo = String(req.body?.titulo || "").trim().slice(0, 90);
   const cuerpo = String(req.body?.cuerpo || "").trim().slice(0, 400);
   const url = String(req.body?.url || "/dashboard.html").trim();
+  const audiencia = ["trabajadores", "equipo"].includes(req.body?.audiencia) ? req.body.audiencia : "trabajadores";
   if (!titulo || !cuerpo) return res.status(400).json({ ok: false, error: "Escribe el título y el mensaje del aviso." });
+  const { usuarios } = seleccionarDestinatariosAviso(audiencia, empresaId);
+  if (!usuarios.length) return res.status(400).json({ ok: false, error: "No hay destinatarios activos en tu equipo." });
 
-  const trabajadores = find("usuarios", u => u.empresa_id === empresaId && u.activo === 1 && u.rol !== "admin");
-  if (!trabajadores.length) return res.status(400).json({ ok: false, error: "Tu equipo aún no tiene trabajadores activos." });
-
-  const ahora = new Date().toISOString();
-  const clave = `aviso-admin-${empresaId}-${Date.now()}`;
-  const destinatarios = trabajadores.map(u => ({ empresa_id: empresaId, correo: u.correo, nombre: u.nombre }));
-  guardarAviso({ empresa_id: empresaId, origen: "admin", titulo, cuerpo, url, destinatarios, creado_en: ahora, creado_por: req.usuario.correo });
-  // Envío push a cada trabajador con su propio owner_id para respetar la deduplicación.
-  const resultados = await Promise.allSettled(trabajadores.map(u =>
-    enviarPush("usuario", u.id, empresaId, { clave, titulo, cuerpo, url })
-  ));
-  const enviados = resultados.filter(r => r.status === "fulfilled" && r.value === true).length;
-  registrarAuditoriaGlobal("aviso_admin", { empresa_id: empresaId, titulo, trabajadores: trabajadores.length, push: enviados });
-  await esperarPersistenciaDB();
-  res.json({ ok: true, destinatarios: trabajadores.length, enviados, mensaje: `Aviso en la bandeja de ${trabajadores.length} trabajador(es). Push entregado en ${enviados} dispositivo(s).` });
+  const resultado = await entregarAviso({
+    origen: "admin", titulo, cuerpo, url, empresaId, audiencia,
+    clave: `aviso-admin-${empresaId}-${Date.now()}`
+  });
+  registrarAuditoriaGlobal("aviso_admin", { empresa_id: empresaId, titulo, audiencia, push: resultado.enviados });
+  res.json({ ok: true, ...resultado, mensaje: `Aviso en la bandeja de ${resultado.destinatarios} persona(s). Push entregado en ${resultado.enviados} dispositivo(s).` });
 });
 
 app.post("/api/superadmin/avisos", requireSuperadmin, async (req, res) => {
   const titulo = String(req.body?.titulo || "").trim().slice(0, 90);
   const cuerpo = String(req.body?.cuerpo || "").trim().slice(0, 400);
   const url = String(req.body?.url || "/admin.html").trim();
+  const audiencia = ["admins", "todos", "superadmins", "empresa"].includes(req.body?.audiencia) ? req.body.audiencia : "admins";
+  const empresaDestino = audiencia === "empresa" ? Number(req.body?.empresa_id || 0) : null;
   if (!titulo || !cuerpo) return res.status(400).json({ ok: false, error: "Escribe el título y el mensaje del aviso." });
 
-  const administradores = find("usuarios", u => u.rol === "admin" && u.activo === 1);
-  if (!administradores.length) return res.status(400).json({ ok: false, error: "No hay administradores activos." });
-
-  const ahora = new Date().toISOString();
-  const clave = `aviso-superadmin-${Date.now()}`;
-  const destinatarios = administradores.map(u => ({ empresa_id: u.empresa_id, correo: u.correo, nombre: u.nombre }));
-  guardarAviso({ empresa_id: null, origen: "superadmin", titulo, cuerpo, url, destinatarios, creado_en: ahora, creado_por: "superadmin" });
-  const resultados = await Promise.allSettled(administradores.map(u =>
-    enviarPush("usuario", u.id, u.empresa_id, { clave, titulo, cuerpo, url })
-  ));
-  const enviados = resultados.filter(r => r.status === "fulfilled" && r.value === true).length;
-  registrarAuditoriaGlobal("aviso_superadmin", { titulo, administradores: administradores.length, push: enviados });
-  await esperarPersistenciaDB();
-  res.json({ ok: true, destinatarios: administradores.length, enviados, mensaje: `Aviso en la bandeja de ${administradores.length} administrador(es). Push entregado en ${enviados} dispositivo(s).` });
+  const resultado = await entregarAviso({
+    origen: "superadmin", titulo, cuerpo, url, empresaId: empresaDestino, audiencia,
+    clave: `aviso-superadmin-${Date.now()}`
+  });
+  if (!resultado.destinatarios) return res.status(400).json({ ok: false, error: "No hay destinatarios activos." });
+  registrarAuditoriaGlobal("aviso_superadmin", { titulo, audiencia, push: resultado.enviados });
+  res.json({ ok: true, ...resultado, mensaje: `Aviso en la bandeja de ${resultado.destinatarios} persona(s). Push entregado en ${resultado.enviados} dispositivo(s).` });
 });
 
 function registrarAuditoriaGlobal(accion, detalle) {
@@ -4225,6 +4260,25 @@ function horaLocalActual() {
   }).format(new Date());
 }
 
+// Los recordatorios automáticos también se dejan en la bandeja de la app,
+// para que se vean en el celular aunque el push del navegador no esté activo.
+function registrarAvisoAutomatico(usuario, aviso) {
+  try {
+    guardarAviso({
+      empresa_id: usuario.empresa_id,
+      origen: "sistema",
+      titulo: aviso.titulo,
+      cuerpo: aviso.cuerpo,
+      url: aviso.url || "/dashboard.html",
+      destinatarios: [{ empresa_id: usuario.empresa_id, correo: usuario.correo, nombre: usuario.nombre }],
+      creado_en: new Date().toISOString(),
+      creado_por: "sistema"
+    });
+  } catch (error) {
+    console.warn("No se pudo dejar el aviso automático en la bandeja:", error.message);
+  }
+}
+
 async function revisarRecordatoriosProgramados() {
   const hoy = claveFecha(new Date());
   const ahora = new Date();
@@ -4241,23 +4295,27 @@ async function revisarRecordatoriosProgramados() {
       const salidaComida = aMinutos(registro.comida_entrada);
       const duracionComida = normalizarMinutosComida(usuario.minutos_comida || MINUTOS_COMIDA_POR_DEFECTO);
       if (salidaComida !== null && minutosAhora >= salidaComida + duracionComida) {
-        await enviarPush("usuario", usuario.id, usuario.empresa_id, {
+        const aviso = {
           clave: `regreso-comida-${usuario.empresa_id}-${usuario.id}-${hoy}`,
           titulo: "Registra tu regreso de comida",
           cuerpo: "Ya pasó tu tiempo de comida. No olvides marcar tu regreso.",
           url: "/dashboard.html"
-        });
+        };
+        registrarAvisoAutomatico(usuario, aviso);
+        await enviarPush("usuario", usuario.id, usuario.empresa_id, aviso);
       }
     }
     const horario = obtenerHorarioParaFecha(usuario.area, fecha, usuario.correo, usuario.empresa_id);
     const finTurno = aMinutos(horario?.fin);
     if (finTurno !== null && minutosAhora >= finTurno - 15 && minutosAhora < finTurno) {
-      await enviarPush("usuario", usuario.id, usuario.empresa_id, {
+      const aviso = {
         clave: `salida-jornada-${usuario.empresa_id}-${usuario.id}-${hoy}`,
         titulo: "Ya casi termina tu turno",
         cuerpo: "No olvides marcar tu salida al terminar tu jornada.",
         url: "/dashboard.html"
-      });
+      };
+      registrarAvisoAutomatico(usuario, aviso);
+      await enviarPush("usuario", usuario.id, usuario.empresa_id, aviso);
     }
   }
 
