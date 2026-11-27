@@ -1837,6 +1837,30 @@ app.post("/api/admin/solicitar-codigo", requireAdmin, (req, res) => {
   res.json({ ok: true, mensaje: `${esAmpliacion ? "Solicitud de ampliación" : "Solicitud de código"} registrada para ${nombreSolicitante}. Continúa por WhatsApp para confirmar el pago.` });
 });
 
+// El administrador puede pedir la renovación de su membresía cuando está por
+// vencer o ya venció. Avisa por push al superadmin para que registre el pago.
+app.post("/api/admin/renovar-suscripcion", requireAdmin, async (req, res) => {
+  const empresa = findOne("empresa", e => e.id === req.usuario.empresa_id);
+  if (!empresa) return res.status(404).json({ ok: false, error: "Equipo no encontrado." });
+  const hoy = claveFecha(new Date());
+  if (suscripcionActiva(empresa) && empresa.fecha_fin_suscripcion && empresa.fecha_fin_suscripcion > hoy) {
+    return res.status(409).json({ ok: false, error: "Tu membresía todavía está vigente hasta " + empresa.fecha_fin_suscripcion + "." });
+  }
+  const ahora = new Date().toISOString();
+  update("empresa", empresa.id, {
+    solicitud_codigo_estado: "solicitada_renovacion",
+    solicitud_codigo_en: ahora
+  });
+  await esperarPersistenciaDB();
+  notificarSuperadmins({
+    clave: `renovacion-solicitada-${empresa.id}-${ahora.slice(0, 16)}`,
+    titulo: "Solicitud de renovación",
+    cuerpo: `${empresa.nombre} (${req.usuario.correo}) solicita renovar su membresía. Registra el pago para renovar su código.`,
+    url: "/superadmin.html"
+  });
+  res.json({ ok: true, mensaje: "Solicitud de renovación enviada a JJM Clock. Te avisaremos cuando se confirme el pago." });
+});
+
 app.post("/api/admin/usuarios", requireAdmin, (req, res) => {
   const empresaId = req.usuario.empresa_id;
   const { id, correo, nombre, area, activo, minutos_comida, fecha_ingreso, rol } = req.body || {};
@@ -4351,15 +4375,27 @@ async function revisarRecordatoriosProgramados() {
 
   const minutoDia = minutosAhora;
   if (minutoDia >= 9 * 60 && minutoDia < 9 * 60 + 2) {
-    for (const empresa of db.empresa.filter(e => estadoSuscripcion(e) === "activa" && e.fecha_fin_suscripcion)) {
+    for (const empresa of db.empresa.filter(e => e.fecha_fin_suscripcion)) {
+      const estado = estadoSuscripcion(empresa);
       const fin = fechaDesdeEntrada(empresa.fecha_fin_suscripcion);
       const diasRestantes = Math.ceil((new Date(fin.getFullYear(), fin.getMonth(), fin.getDate()).getTime() - new Date(fecha.getFullYear(), fecha.getMonth(), fecha.getDate()).getTime()) / 86400000);
-      if (![7, 3, 1, 0].includes(diasRestantes)) continue;
+      const porVencer = estado === "activa" && [7, 3, 1, 0].includes(diasRestantes);
+      const vencida = estado === "vencida";
+      if (!porVencer && !vencida) continue;
+      const titulo = vencida
+        ? "Tu membresía venció"
+        : diasRestantes === 0 ? "Tu membresía vence hoy" : `Tu membresía vence en ${diasRestantes} días`;
+      const cuerpo = vencida
+        ? "Renueva desde Código y notificaciones para seguir usando JJMClock sin interrupciones."
+        : `Tu equipo tiene ${empresa.cupos_limite || 0} cupos. Renueva desde Código y notificaciones.`;
       await notificarAdministradores(empresa.id, {
-        clave: `membresia-${empresa.id}-${hoy}-${diasRestantes}`,
-        titulo: diasRestantes === 0 ? "Tu membresía vence hoy" : `Tu membresía vence en ${diasRestantes} días`,
-        cuerpo: `Tu equipo tiene ${empresa.cupos_limite || 0} cupos. Contacta a JJM Clock para renovar.`,
-        url: "/admin.html"
+        clave: `membresia-${empresa.id}-${hoy}-${vencida ? 'vencida' : diasRestantes}`,
+        titulo, cuerpo, url: "/admin.html"
+      });
+      await notificarSuperadmins({
+        clave: `membresia-super-${empresa.id}-${hoy}-${vencida ? 'vencida' : diasRestantes}`,
+        titulo: `${empresa.nombre}: ${titulo.toLowerCase()}`,
+        cuerpo, url: "/superadmin.html"
       });
     }
   }
