@@ -4105,6 +4105,31 @@ function configurarRutasPush(scope, requireMiddleware, prefijo) {
 configurarRutasPush("usuario", requireAuth, "/api/notificaciones");
 configurarRutasPush("superadmin", requireSuperadmin, "/api/superadmin/notificaciones");
 
+// Reinicio de base (solo superadmin). Borra equipos, usuarios, asistencias y
+// todo dato de prueba. Conserva la cuenta superadmin y la llave VAPID para que
+// los dispositivos ya registrados sigan siendo válidos.
+app.post("/api/superadmin/base/limpiar", requireSuperadmin, async (req, res) => {
+  if (String(req.body?.confirmacion || "").toUpperCase() !== "LIMPIAR") {
+    return res.status(400).json({ ok: false, error: "Envía confirmacion: 'LIMPIAR' para borrar todos los datos de equipos." });
+  }
+  const superadmins = JSON.parse(JSON.stringify(db.superadmins || []));
+  const vapid = JSON.parse(JSON.stringify(find("push_suscripciones", s => s.scope === "vapid_config")));
+  const borradas = {};
+  for (const tabla of TABLAS) {
+    borradas[tabla] = (db[tabla] || []).length;
+    db[tabla] = [];
+  }
+  db.superadmins = superadmins;
+  db.push_suscripciones = vapid;
+  nextIdCounter = {};
+  try {
+    registrarAuditoriaGlobal("base_limpiada", { por: req.superadmin.correo, borradas });
+  } catch { /* la auditoría es opcional */ }
+  guardarDB();
+  await esperarPersistenciaDB();
+  res.json({ ok: true, borradas, mensaje: "Base limpia. Solo queda la cuenta superadmin y la configuración de notificaciones." });
+});
+
 // Diagnóstico (solo superadmin): permite ver cuántos dispositivos están dados
 // de alta, sin exponer endpoints ni claves de suscripción.
 app.get("/api/superadmin/notificaciones/diagnostico", requireSuperadmin, (req, res) => {
